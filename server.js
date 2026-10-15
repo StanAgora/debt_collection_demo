@@ -2,12 +2,17 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { debtorDetails, backfillDemoSources, requireDebtorSources } = require("./lib/debtors");
+const { ServiceMonitor } = require("./lib/monitor");
+const { buildAgoraInput } = require("./lib/agora-input");
+const { newTaskId, prepareSipInput, matchWebhookCall } = require("./lib/agora-sip");
+const { Telephony, DEFAULT_AGORA_SIP, isActive, validateRoute, finish } = require("./lib/telephony");
 
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || "127.0.0.1";
-const DATA_FILE = path.join(__dirname, "data", "db.json");
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, "data", "db.json");
 const PUBLIC_DIR = path.join(__dirname, "public");
-const DEFAULT_AGORA_SIP = "sip:gptest@cn-north-1-sbc.ai.agora.io:5060;transport=tcp";
+
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -15,6 +20,7 @@ const mimeTypes = {
   ".js": "application/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".svg": "image/svg+xml",
+  ".png": "image/png",
   ".ico": "image/x-icon"
 };
 
@@ -158,11 +164,11 @@ function ensureDataFile() {
     routes: [
       {
         id: "route_default",
-        name: "默认预测式外呼路由",
-        mobileTrunk: "sip:carrier-trunk@example.com:5060;transport=tcp",
+        name: "软电话 → Agora Voice Agent",
+        extension: "1001",
         agoraSip: DEFAULT_AGORA_SIP,
         enabled: true,
-        description: "先呼叫债务人手机，接通后桥接到 Agora Voice Agent。",
+        description: "先呼叫软电话分机，接听后连接 Agora Voice Agent。",
         createdAt: nowIso()
       }
     ],
@@ -222,11 +228,40 @@ function ensureDataFile() {
 
 function readDb() {
   ensureDataFile();
-  return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+  const db = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+  if ((db.schemaVersion || 0) < 2) {
+    for (const route of db.routes) {
+      if (route.extension) continue;
+      route.extension = "1001";
+      if (route.id === "route_default") {
+        route.name = "软电话 → Agora Voice Agent";
+        route.description = "先呼叫软电话分机，接听后连接 Agora Voice Agent。";
+        if (route.agoraSip === "sip:gptest@cn-north-1-sbc.ai.agora.io:5060;transport=tcp") route.agoraSip = DEFAULT_AGORA_SIP;
+      } else {
+        route.enabled = false;
+        route.description = `${route.description || ""}（旧路由已停用，请确认分机配置后启用）`;
+      }
+      // Preserve the old trunk for reference; it is never used for dialing.
+    }
+    db.schemaVersion = 2;
+    writeDb(db);
+  }
+  if ((db.schemaVersion || 0) < 3) {
+    for (const debtor of db.debtors) Object.assign(debtor, debtorDetails({}, debtor));
+    db.schemaVersion = 3;
+    writeDb(db);
+  }
+  if ((db.schemaVersion || 0) < 4) {
+    for (const debtor of db.debtors) backfillDemoSources(debtor);
+    db.schemaVersion = 4;
+    writeDb(db);
+  }
+  return db;
 }
 
 function writeDb(db) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+  fs.writeFileSync(`${DATA_FILE}.tmp`, JSON.stringify(db, null, 2));
+  fs.renameSync(`${DATA_FILE}.tmp`, DATA_FILE);
 }
 
 function publicUser(user) {
@@ -326,10 +361,10 @@ function addAudit(db, user, action, detail) {
 }
 
 async function handleApi(req, res, pathname) {
+  const body = ["POST", "PATCH"].includes(req.method) ? await readBody(req) : {};
   const db = readDb();
 
   if (req.method === "POST" && pathname === "/api/auth/login") {
-    const body = await readBody(req);
     const user = db.users.find(item => item.username === body.username && item.active);
     if (!user || !verifyPassword(body.password || "", user.passwordHash)) {
       return sendError(res, 401, "用户名或密码不正确");
@@ -350,45 +385,31 @@ async function handleApi(req, res, pathname) {
   }
 
   if (req.method === "POST" && pathname === "/api/webhooks/agora/calls") {
-    const body = await readBody(req);
-    const debtor = db.debtors.find(item => item.id === body.debtorId || item.phone === body.phone);
-    const call = {
-      id: body.callId || randomId("call"),
-      debtorId: debtor?.id || body.debtorId || null,
-      debtorName: debtor?.name || body.debtorName || "未知客户",
-      debtorPhone: debtor?.phone || body.phone || "",
-      attempt: body.attempt || (debtor ? db.calls.filter(item => item.debtorId === debtor.id).length + 1 : 1),
-      routeId: body.routeId || "route_default",
-      status: body.status || "已完成",
-      startedAt: body.startedAt || nowIso(),
-      answeredAt: body.answeredAt || null,
-      endedAt: body.endedAt || nowIso(),
-      durationSec: Number(body.durationSec || 0),
-      recordingUrl: body.recordingUrl || "",
-      transcript: normalizeTranscript(body.transcript),
-      summary: body.summary || "Webhook 已回传，等待质检补充。",
-      qaTags: [],
-      qaNote: "",
+    const webhookToken = process.env.AGORA_WEBHOOK_TOKEN;
+    if (!getSessionUser(req, db) && (!webhookToken || req.headers.authorization !== `Bearer ${webhookToken}`)) {
+      return sendError(res, 401, "Webhook 认证失败");
+    }
+    const match = matchWebhookCall(db.calls, body);
+    if (match.error) return sendError(res, match.status, match.error);
+    const { call } = match;
+    if (match.matchedTaskId && call.agoraInput?.sip) call.agoraInput.deliveryStatus = "callback_received";
+    const debtor = db.debtors.find(item => item.id === call.debtorId);
+    Object.assign(call, {
+      recordingUrl: body.recordingUrl ?? call.recordingUrl,
+      transcript: body.transcript === undefined ? call.transcript : normalizeTranscript(body.transcript),
+      summary: body.summary ?? call.summary,
+      resultReceivedAt: nowIso(),
       webhookPayload: body
-    };
-    db.calls.unshift(call);
+    });
+    // Call lifecycle is owned by FreeSWITCH, quality results by the webhook.
     if (debtor) {
-      debtor.history.unshift({
-        id: randomId("hist"),
-        callId: call.id,
-        time: call.endedAt,
-        result: call.status,
-        summary: call.summary,
-        nextAction: body.nextAction || "待人工质检"
-      });
       debtor.collectionStatus = body.needRecall ? "需复催" : "已催收";
-      if (body.promiseAmount || body.promiseDate) {
-        debtor.promise = {
-          amount: Number(body.promiseAmount || 0),
-          date: body.promiseDate || "",
-          note: body.promiseNote || ""
-        };
-      }
+      const hist = debtor.history.find(item => item.callId === call.id);
+      if (hist) Object.assign(hist, { summary: call.summary, nextAction: body.nextAction || "待人工质检" });
+      if (body.promiseAmount || body.promiseDate) debtor.promise = {
+        amount: Number(body.promiseAmount || 0), date: body.promiseDate || "", note: body.promiseNote || ""
+      };
+      if (debtor.promise) debtor.hasPromise = true;
       if (body.repaymentStatus) debtor.repaymentStatus = body.repaymentStatus;
     }
     addAudit(db, null, "Agora webhook", `接收通话 ${call.id}`);
@@ -399,11 +420,16 @@ async function handleApi(req, res, pathname) {
   const user = getSessionUser(req, db);
   if (!user) return sendError(res, 401, "请先登录");
 
+  if (req.method === "GET" && pathname === "/api/monitor") {
+    return sendJson(res, 200, await monitor.snapshot());
+  }
+
   if (req.method === "GET" && pathname === "/api/bootstrap") {
     const plannedCalls = getPlannedCalls(db);
-    const activeCalls = db.calls.filter(call => call.status === "拨打中" || call.status === "桥接中").length;
+    const activeCalls = db.calls.filter(isActive).length;
     return sendJson(res, 200, {
       user: publicUser(user),
+      telephony: telephony.status(),
       debtors: db.debtors,
       plannedCalls,
       calls: db.calls,
@@ -421,10 +447,18 @@ async function handleApi(req, res, pathname) {
     });
   }
 
+  if (req.method === "GET" && pathname.match(/^\/api\/debtors\/[^/]+\/agora-input$/)) {
+    const debtor = db.debtors.find(item => item.id === pathname.split("/")[3]);
+    if (!debtor) return sendError(res, 404, "债务人不存在");
+    return sendJson(res, 200, buildAgoraInput(debtor, db.calls));
+  }
+
   if (req.method === "POST" && pathname === "/api/debtors") {
-    const body = await readBody(req);
+    let details;
+    try { details = debtorDetails(body); requireDebtorSources(details); } catch (error) { return sendError(res, 400, error.message); }
     const debtor = {
       id: randomId("debtor"),
+      ...details,
       name: body.name || "未命名客户",
       phone: body.phone || "",
       amount: Number(body.amount || 0),
@@ -446,10 +480,12 @@ async function handleApi(req, res, pathname) {
 
   if (req.method === "PATCH" && pathname.startsWith("/api/debtors/")) {
     const debtorId = pathname.split("/").pop();
-    const body = await readBody(req);
     const debtor = db.debtors.find(item => item.id === debtorId);
     if (!debtor) return sendError(res, 404, "债务人不存在");
+    let details;
+    try { details = debtorDetails(body, debtor); requireDebtorSources(details); } catch (error) { return sendError(res, 400, error.message); }
     Object.assign(debtor, {
+      ...details,
       name: body.name ?? debtor.name,
       phone: body.phone ?? debtor.phone,
       amount: body.amount === undefined ? debtor.amount : Number(body.amount),
@@ -470,97 +506,72 @@ async function handleApi(req, res, pathname) {
 
   if (req.method === "POST" && pathname.match(/^\/api\/calls\/[^/]+\/start$/)) {
     const debtorId = pathname.split("/")[3];
-    const body = await readBody(req);
     const debtor = db.debtors.find(item => item.id === debtorId);
     if (!debtor) return sendError(res, 404, "债务人不存在");
     if (debtor.repaymentStatus === "已还款") return sendError(res, 400, "已还款客户无需外呼");
+    try { requireDebtorSources(debtor); } catch (error) { return sendError(res, 400, error.message); }
     const route = db.routes.find(item => item.id === (body.routeId || "route_default") && item.enabled);
     if (!route) return sendError(res, 400, "未找到可用通话路由");
 
+    try { validateRoute(route); } catch (error) { return sendError(res, 400, error.message); }
+    if (!telephony.status().connected) return sendError(res, 503, "FreeSWITCH 未就绪，请查看通话路由页的连接状态");
+    if (db.calls.some(call => isActive(call) && (call.extension === route.extension || call.debtorId === debtor.id))) {
+      return sendError(res, 409, "该分机或客户已有进行中的通话");
+    }
     const attempt = db.calls.filter(item => item.debtorId === debtor.id).length + 1;
+    const taskId = newTaskId(db.calls);
+    const agoraInput = buildAgoraInput(debtor, db.calls);
+    try { agoraInput.sip = prepareSipInput(taskId, agoraInput.payload); }
+    catch (error) { return sendError(res, 413, error.message); }
+    agoraInput.deliveryStatus = "prepared";
     const call = {
-      id: randomId("call"),
-      debtorId: debtor.id,
-      debtorName: debtor.name,
-      debtorPhone: debtor.phone,
-      attempt,
-      routeId: route.id,
-      status: "桥接中",
-      startedAt: nowIso(),
-      answeredAt: nowIso(),
-      endedAt: null,
-      durationSec: 0,
-      recordingUrl: "",
-      transcript: [
-        { speaker: "系统", text: `已通过 ${route.mobileTrunk} 呼叫 ${debtor.phone}` },
-        { speaker: "系统", text: `客户接通后桥接至 ${route.agoraSip}` }
-      ],
-      summary: "预测式外呼任务已创建，等待 Agora Voice Agent 回传通话结果。",
-      qaTags: [],
-      qaNote: "",
-      webhookPayload: {
-        mode: "predictive-outbound",
-        route,
-        agoraTask: {
-          sipUri: route.agoraSip,
-          debtorId: debtor.id,
-          debtorName: debtor.name,
-          contractNo: debtor.contractNo,
-          amount: debtor.amount,
-          attempt
-        }
-      }
+      id: randomId("call"), taskId, ...telephony.ids(), provider: "freeswitch",
+      debtorId: debtor.id, debtorName: debtor.name, debtorPhone: debtor.phone,
+      attempt, routeId: route.id, extension: route.extension, agoraSip: route.agoraSip,
+      status: "分机呼叫中", startedAt: nowIso(), answeredAt: null, bridgedAt: null,
+      endedAt: null, durationSec: 0, recordingUrl: "", transcript: [],
+      summary: `正在呼叫分机 ${route.extension}，接听后连接 Agora Voice Agent。`,
+      qaTags: [], qaNote: "", webhookPayload: null,
+      agoraInput
     };
     db.calls.unshift(call);
     debtor.collectionStatus = "外呼中";
     debtor.history.unshift({
-      id: randomId("hist"),
-      callId: call.id,
-      time: call.startedAt,
-      result: "任务已发起",
-      summary: `第 ${attempt} 次外呼已发起，等待通话结果回传。`,
-      nextAction: "等待 webhook"
+      id: randomId("hist"), callId: call.id, time: call.startedAt, result: call.status,
+      summary: call.summary, nextAction: "等待通话结束"
     });
-    addAudit(db, user, "发起外呼", `${debtor.name} 第 ${attempt} 次`);
+    addAudit(db, user, "发起分机呼叫", `${debtor.name} → 分机 ${route.extension} → Agora`);
     writeDb(db);
-    return sendJson(res, 201, { call });
+    try {
+      await telephony.originate(call, route);
+    } catch (error) {
+      // A transport error can occur after FreeSWITCH accepted the command.
+      // Keep the UUID reserved until reconnect reconciliation confirms its state.
+      telephony.update(current => {
+        const saved = current.calls.find(item => item.id === call.id);
+        if (!saved || !isActive(saved)) return;
+        if (telephony.client.ready) finish(saved, error.message);
+        else { saved.status = "状态待确认"; saved.summary = "控制连接中断，重连后自动核对呼叫结果。"; }
+        telephony.updateHistory(current, saved);
+      });
+      return sendError(res, 502, `呼叫提交未确认：${error.message}。请查看通话记录。`);
+    }
+    return sendJson(res, 201, { call: readDb().calls.find(item => item.id === call.id) });
   }
 
-  if (req.method === "POST" && pathname.match(/^\/api\/calls\/[^/]+\/complete-mock$/)) {
-    const callId = pathname.split("/")[3];
-    const body = await readBody(req);
-    const call = db.calls.find(item => item.id === callId);
+  if (req.method === "POST" && pathname.match(/^\/api\/calls\/[^/]+\/hangup$/)) {
+    const call = db.calls.find(item => item.id === pathname.split("/")[3]);
     if (!call) return sendError(res, 404, "通话不存在");
-    const debtor = db.debtors.find(item => item.id === call.debtorId);
-    call.status = body.status || "已完成";
-    call.endedAt = nowIso();
-    call.durationSec = Number(body.durationSec || 188);
-    call.recordingUrl = body.recordingUrl || `https://example.com/recordings/${call.id}.wav`;
-    call.transcript = normalizeTranscript(body.transcript || [
-      { speaker: "AI", text: `您好，请问是${call.debtorName}本人吗？` },
-      { speaker: "客户", text: "是的，我知道这笔逾期。" },
-      { speaker: "AI", text: "请问您是否可以确认一个还款时间？" },
-      { speaker: "客户", text: "我会尽快处理，需要再提醒我一次。" }
-    ]);
-    call.summary = body.summary || "客户确认欠款但未明确还款时间，建议复催。";
-    if (debtor) {
-      debtor.collectionStatus = body.needRecall === false ? "已催收" : "需复催";
-      const hist = debtor.history.find(item => item.callId === call.id);
-      if (hist) {
-        hist.result = call.status;
-        hist.summary = call.summary;
-        hist.nextAction = debtor.collectionStatus;
-        hist.time = call.endedAt;
-      }
-    }
-    addAudit(db, user, "模拟回传", call.id);
+    if (!isActive(call)) return sendError(res, 409, "通话已结束");
+    call.cancelRequested = true;
     writeDb(db);
-    return sendJson(res, 200, { call });
+    try { await telephony.hangup(call); }
+    catch (error) { return sendError(res, 502, `挂断未确认：${error.message}`); }
+    return sendJson(res, 200, { ok: true });
   }
 
   if (req.method === "PATCH" && pathname.match(/^\/api\/calls\/[^/]+\/qa$/)) {
     const callId = pathname.split("/")[3];
-    const body = await readBody(req);
     const call = db.calls.find(item => item.id === callId);
     if (!call) return sendError(res, 404, "通话不存在");
     call.qaTags = Array.isArray(body.qaTags) ? body.qaTags : [];
@@ -571,16 +582,16 @@ async function handleApi(req, res, pathname) {
   }
 
   if (req.method === "POST" && pathname === "/api/routes") {
-    const body = await readBody(req);
     const route = {
       id: randomId("route"),
       name: body.name || "未命名路由",
-      mobileTrunk: body.mobileTrunk || "",
+      extension: body.extension || "1001",
       agoraSip: body.agoraSip || DEFAULT_AGORA_SIP,
       enabled: body.enabled !== false,
       description: body.description || "",
       createdAt: nowIso()
     };
+    try { validateRoute(route); } catch (error) { return sendError(res, 400, error.message); }
     db.routes.unshift(route);
     addAudit(db, user, "新增路由", route.name);
     writeDb(db);
@@ -589,23 +600,23 @@ async function handleApi(req, res, pathname) {
 
   if (req.method === "PATCH" && pathname.startsWith("/api/routes/")) {
     const routeId = pathname.split("/").pop();
-    const body = await readBody(req);
     const route = db.routes.find(item => item.id === routeId);
     if (!route) return sendError(res, 404, "路由不存在");
-    Object.assign(route, {
+    const updated = { ...route,
       name: body.name ?? route.name,
-      mobileTrunk: body.mobileTrunk ?? route.mobileTrunk,
+      extension: body.extension ?? route.extension,
       agoraSip: body.agoraSip ?? route.agoraSip,
       enabled: body.enabled ?? route.enabled,
       description: body.description ?? route.description
-    });
+    };
+    try { validateRoute(updated); } catch (error) { return sendError(res, 400, error.message); }
+    Object.assign(route, updated);
     addAudit(db, user, "更新路由", route.name);
     writeDb(db);
     return sendJson(res, 200, { route });
   }
 
   if (req.method === "POST" && pathname === "/api/users") {
-    const body = await readBody(req);
     if (!body.username || !body.password) return sendError(res, 400, "用户名和初始密码必填");
     if (db.users.some(item => item.username === body.username)) return sendError(res, 409, "用户名已存在");
     const created = {
@@ -626,7 +637,6 @@ async function handleApi(req, res, pathname) {
 
   if (req.method === "PATCH" && pathname.match(/^\/api\/users\/[^/]+\/password$/)) {
     const userId = pathname.split("/")[3];
-    const body = await readBody(req);
     const target = db.users.find(item => item.id === userId);
     if (!target) return sendError(res, 404, "账号不存在");
     if (!body.password || body.password.length < 6) return sendError(res, 400, "密码至少 6 位");
@@ -638,7 +648,6 @@ async function handleApi(req, res, pathname) {
 
   if (req.method === "PATCH" && pathname.startsWith("/api/users/")) {
     const userId = pathname.split("/").pop();
-    const body = await readBody(req);
     const target = db.users.find(item => item.id === userId);
     if (!target) return sendError(res, 404, "账号不存在");
     target.name = body.name ?? target.name;
@@ -690,8 +699,15 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-ensureDataFile();
+readDb();
+const telephony = new Telephony({ readDb, writeDb });
+telephony.start();
+const monitor = new ServiceMonitor({ telephony, readDb, dataFile: DATA_FILE });
+for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => {
+  telephony.stop();
+  server.close(() => process.exit(0));
+});
 server.listen(PORT, HOST, () => {
-  console.log(`Debt collection demo is running at http://${HOST}:${PORT}`);
+  console.log(`Debt collection demo is running at http://${HOST}:${server.address().port}`);
   console.log("Default login: admin / admin123");
 });

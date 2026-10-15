@@ -77,8 +77,8 @@ button:disabled {
   max-width: 680px;
   margin: 0;
   color: white;
-  font-size: 48px;
-  line-height: 1.08;
+  font-size: clamp(28px, 2.8vw, 40px);
+  line-height: 1.45;
   font-weight: 760;
   letter-spacing: 0;
 }
@@ -104,6 +104,24 @@ button:disabled {
 .login-copy {
   margin: 0 0 32px;
   color: var(--muted);
+}
+
+.login-support {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+}
+
+.login-support span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.login-support img {
+  display: block;
+  width: 112px;
+  height: auto;
 }
 
 .field {
@@ -207,8 +225,25 @@ button:disabled {
   color: white;
 }
 
-.sidebar-footer {
+.sidebar-support {
   margin-top: auto;
+  padding: 16px 12px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.sidebar-support span {
+  display: block;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 11px;
+}
+
+.sidebar-support img {
+  display: block;
+  width: 112px;
+  height: auto;
+}
+
+.sidebar-footer {
   padding: 12px 8px 0;
   color: rgba(255, 255, 255, 0.68);
   border-top: 1px solid rgba(255, 255, 255, 0.12);
@@ -681,6 +716,20 @@ tr:last-child td {
   .login-art {
     display: none;
   }
+
+  .sidebar-support {
+    margin-top: 0;
+    padding: 0 8px;
+    border-top: 0;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 10px;
+  }
+
+  .sidebar-support img {
+    width: 80px;
+  }
 }
 
 @media (max-width: 760px) {
@@ -715,3 +764,39 @@ tr:last-child td {
     display: none;
   }
 }
+
+.call-controls { margin-bottom: 24px; }
+.call-controls select { max-width: 100%; padding: 8px; border: 1px solid #dbe3ef; border-radius: 8px; background: white; }
+.call-controls .detail-box .badge { margin: 0 12px; }
+
+.debtor-table { min-width: 1120px; }
+.debtor-table td { overflow-wrap: anywhere; }
+.debtor-summary { min-width: 220px; max-width: 360px; white-space: pre-wrap; }
+.debtor-flag { margin-top: 8px; }
+.debtor-actions { display: grid; gap: 8px; min-width: 130px; }
+.field.full-width { grid-column: 1 / -1; }
+.history-overview { margin-bottom: 20px; }
+.debtor-history-list { display: grid; gap: 16px; }
+.preserve-lines { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.monitor-heading { font-size: 18px; margin: 28px 0 14px; }
+.monitor-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 310px), 1fr)); gap: 16px; }
+.monitor-card { padding: 20px; min-width: 0; }
+.monitor-card p { line-height: 1.6; overflow-wrap: anywhere; }
+.monitor-card-head { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+.monitor-card-head h3 { margin: 0; font-size: 15px; }
+.monitor-card-head .badge { flex-shrink: 0; }
+.monitor-notice { padding: 14px 18px; border: 1px solid #e6c892; background: #fffaed; border-radius: 8px; color: #7e5518; margin-bottom: 16px; }
+.monitor-address { font-family: monospace; font-size: 12px; }
+.monitor-registration + .monitor-registration { margin-top: 8px; }
+
+.planned-page-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 16px; align-items: start; }
+
+.planned-customer-card { cursor: pointer; }
+.planned-customer-card:hover, .planned-customer-card:focus-visible { border-color: var(--brand); box-shadow: 0 0 0 3px var(--focus); outline: none; }
+.modal-wide { width: min(960px, 100%); }
+.payload-preview { white-space: pre-wrap; overflow-wrap: anywhere; overflow: auto; padding: 18px; border: 1px solid var(--line); border-radius: 8px; background: #f6f8f7; font-size: 13px; line-height: 1.65; user-select: text; }
+.input-details { margin-top: 18px; }
+.input-details summary { cursor: pointer; font-weight: 600; padding: 10px 0; }
+.input-fields-table { min-width: 0; }
+.input-fields-table td { overflow-wrap: anywhere; }

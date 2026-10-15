@@ -2,9 +2,10 @@
   "name": "debt-collection-demo",
   "version": "0.1.0",
   "private": true,
-  "description": "Debt collection web demo with predictive outbound routing and Agora Voice Agent handoff simulation.",
+  "description": "FreeSWITCH SIP extension to Agora Voice Agent calling demo",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"

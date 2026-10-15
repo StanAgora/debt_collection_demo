@@ -1,0 +1,15 @@
+# Recommended for a public Linux server: no Docker NAT in the media path.
+# Usage: docker compose -f compose.yaml -f compose.linux.yaml up -d --build
+services:
+  freeswitch:
+    network_mode: host
+    ports: !reset []
+    environment:
+      ESL_LISTEN_IP: 127.0.0.1
+      ESL_ALLOWED_CIDR: 127.0.0.0/8
+  web:
+    network_mode: host
+    ports: !reset []
+    environment:
+      HOST: 127.0.0.1
+      FREESWITCH_HOST: 127.0.0.1

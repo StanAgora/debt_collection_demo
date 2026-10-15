@@ -1,0 +1,46 @@
+services:
+  web:
+    build: .
+    ports:
+      - "127.0.0.1:4173:4173"
+    environment:
+      FREESWITCH_HOST: freeswitch
+      FREESWITCH_ESL_PASSWORD: ${FREESWITCH_ESL_PASSWORD:?Set FREESWITCH_ESL_PASSWORD in .env}
+      SIP_DOMAIN: ${SIP_DOMAIN:-demo.local}
+      AGORA_WEBHOOK_TOKEN: ${AGORA_WEBHOOK_TOKEN:-}
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      freeswitch:
+        condition: service_healthy
+    restart: unless-stopped
+  freeswitch:
+    # Community image; override with a verified version/digest in .env.
+    image: ${FREESWITCH_IMAGE:-safarov/freeswitch@sha256:f156e01a96d48944078ed7f0e24304be63ea15f6466cf607a0aeb6cb47761da7}
+    platform: ${FREESWITCH_PLATFORM:-linux/amd64}
+    entrypoint: ["/bin/sh", "/opt/demo/entrypoint.sh"]
+    environment:
+      FREESWITCH_PUBLIC_IP: ${FREESWITCH_PUBLIC_IP:?Set a reachable media IP in .env}
+      FREESWITCH_ESL_PASSWORD: ${FREESWITCH_ESL_PASSWORD:?Set FREESWITCH_ESL_PASSWORD in .env}
+      SIP_EXTENSION_PASSWORD: ${SIP_EXTENSION_PASSWORD:?Set SIP_EXTENSION_PASSWORD in .env}
+      SIP_DOMAIN: ${SIP_DOMAIN:-demo.local}
+      ESL_ALLOWED_CIDR: ${ESL_ALLOWED_CIDR:-172.30.86.0/24}
+    volumes:
+      - ./deploy/freeswitch:/opt/demo:ro
+    ports:
+      - "5060:5060/tcp"
+      - "5060:5060/udp"
+      - "5080:5080/tcp"
+      - "10000-10099:10000-10099/udp"
+    healthcheck:
+      test: ["CMD-SHELL", "fs_cli -H 127.0.0.1 -p \"$$FREESWITCH_ESL_PASSWORD\" -x 'sofia status' | grep -q 'internal.*RUNNING'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${DEMO_SUBNET:-172.30.86.0/24}
